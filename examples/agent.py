@@ -82,6 +82,31 @@ def retrieve_solver_context(table: dict) -> dict:
     return {}
 
 
+# Stage 1: TAG 开牌范围
+OPENING_RANGES = {
+    "UTG": {"AA","KK","QQ","JJ","TT","99","AKs","AKo","AQs"},
+    "MP":  {"AA","KK","QQ","JJ","TT","99","88","AKs","AKo","AQs","AQo","AJs","KQs"},
+    "CO":  {"AA","KK","QQ","JJ","TT","99","88","77","66","55",
+            "AKs","AKo","AQs","AQo","AJs","AJo","ATs","KQs","KQo","KJs","KTs",
+            "QJs","QTs","JTs","T9s","98s"},
+    "BTN": {"AA","KK","QQ","JJ","TT","99","88","77","66","55","44","33","22",
+            "AKs","AKo","AQs","AQo","AJs","AJo","ATs","ATo",
+            "A9s","A8s","A7s","A6s","A5s","A4s","A3s","A2s",
+            "KQs","KQo","KJs","KJo","KTs","K9s",
+            "QJs","QTs","Q9s","JTs","J9s","T9s","98s","87s","76s"},
+    "SB":  {"AA","KK","QQ","JJ","TT","99","88","AKs","AKo","AQs","AQo","AJs","ATs","KQs","KJs","QJs"},
+    "BB":  {"AA","KK","QQ","JJ","TT","AKs","AKo","AQs"},
+}
+SEAT_TO_POS = {1: "BTN", 2: "SB", 3: "BB", 4: "UTG", 5: "MP", 6: "CO"}
+
+# Stage 3: 牌面纹理感知尺寸
+SIZING = {
+    "dry":     {"flop": 0.33, "turn": 0.50, "river": 0.66},
+    "wet":     {"flop": 0.66, "turn": 0.75, "river": 0.75},
+    "neutral": {"flop": 0.50, "turn": 0.60, "river": 0.66},
+}
+
+
 # ─── Hand strength estimation (treys) ─────────────────────────────────
 
 # Preflop equity table — used when treys is unavailable, or as a preflop
@@ -110,6 +135,34 @@ def _hand_class(hole: list[str]) -> str:
     if r1 == r2:
         return r1 + r2
     return f"{r1}{r2}{'s' if s1 == s2 else 'o'}"
+
+
+def _street_from_board(board: list) -> str:
+    if not board:
+        return "preflop"
+    return ("flop", "turn", "river")[max(0, min(len(board) - 3, 2))]
+
+
+def _board_texture(board: list) -> str:
+    """将牌面分类为 dry / wet / neutral"""
+    if len(board) < 3:
+        return "neutral"
+    suits = [c[-1].lower() for c in board]
+    rank_order = "23456789TJQKA"
+    ranks = sorted(rank_order.index(c[0].upper()) for c in board
+                   if c[0].upper() in rank_order)
+    monotone = len(set(suits)) == 1
+    two_tone = (len(set(suits)) == 2 and
+                max(suits.count(s) for s in set(suits)) >= 2)
+    connected = (max(ranks) - min(ranks)) <= 4 if ranks else False
+    paired = len(set(c[0] for c in board)) < len(board)
+    if monotone or (two_tone and connected):
+        return "wet"
+    if paired and not connected:
+        return "dry"
+    if connected:
+        return "wet"
+    return "dry"
 
 
 def estimate_equity(hole: list[str], board: list[str], sims: int = 200,
@@ -168,26 +221,22 @@ def _to_treys(card_str: str) -> str:
 
 def decide(table: dict, deadline_s: float = 10.0,
            research_context: Optional[dict] = None) -> dict:
-    """Return one action: {action, amount?, message, reasoning}.
-
-    Reasoning is YAML flow style, max 150 chars, required on benchmark tables:
-      {vr: "<range>", ke: "<num+unit>", bf: [<features>], pp: "<plan>", sr: "<size reason>"}
-
-    research_context is an optional dict from retrieve_solver_context() —
-    L1 ignores it. L2/L3 should consult it (preflop charts, postflop
-    solver frequencies, opponent style)."""
+    """TAG 紧攻型决策函数，集成阶段1-3优化：
+    - Stage 1: 位置感知开牌范围 (OPENING_RANGES)
+    - Stage 2: 翻后位置 + 牌力逻辑
+    - Stage 3: 牌面纹理感知尺寸 (SIZING)
+    """
     allowed = table.get("allowedActions") or {}
     available = allowed.get("availableActions") or []
 
-    # Deadline fallback: prefer check, then small call, then fold.
     if deadline_s < 2.0:
         if allowed.get("canCheck"):
-            return _build("check", None, table, allowed, eq=0.5, po=0.0,
-                          msg="deadline tight, taking free option")
-        return _build("fold", None, table, allowed, eq=0.0, po=1.0,
-                      msg="deadline tight and price not justified")
+            return {"action": "check", "message": "deadline tight",
+                    "reasoning": _FALLBACK_REASONING}
+        return {"action": "fold", "message": "deadline tight",
+                "reasoning": _FALLBACK_REASONING}
 
-    self_seat_num = table.get("selfSeatNumber")
+    self_seat_num = table.get("selfSeatNumber") or 0
     seats = table.get("seats") or []
     self_seat = next((s for s in seats if s.get("seatNumber") == self_seat_num), {})
     hole = list(self_seat.get("holeCards") or [])
@@ -197,55 +246,117 @@ def decide(table: dict, deadline_s: float = 10.0,
     call_chips = int(allowed.get("callChips") or 0)
     pot_odds = call_chips / max(pot + call_chips, 1) if call_chips else 0.0
 
+    cls = _hand_class(hole)
+    pos = SEAT_TO_POS.get(self_seat_num, "MP")
+    street = _street_from_board(board)
+    texture = _board_texture(board) if board else "neutral"
+
+    # ── 翻前逻辑 ────────────────────────────────────────────────────────
+    if street == "preflop":
+        if call_chips == 0:
+            if cls in OPENING_RANGES.get(pos, set()):
+                rr = allowed.get("raiseRange") or {}
+                lo = int(rr.get("min") or 4)
+                hi = int(rr.get("max") or lo)
+                amt = max(lo, min(int(lo * 2.5), hi))
+                action = "raise" if "raise" in available else (
+                    "bet" if "bet" in available else None)
+                if action:
+                    return {
+                        "action": action, "amount": amt,
+                        "message": f"open {cls} from {pos} (TAG range)",
+                        "reasoning": (
+                            f'{{vr: "TAG", ke: "{cls} open", '
+                            f'bf: [], pp: "IP barrel T", sr: "2.5bb open"}}')
+                    }
+            if "check" in available:
+                return {"action": "check", "message": f"{cls} not in {pos} range",
+                        "reasoning": _FALLBACK_REASONING}
+            return {"action": "fold", "message": f"{cls} not in {pos} range",
+                    "reasoning": _FALLBACK_REASONING}
+        else:
+            defend = (OPENING_RANGES.get("BB", set()) |
+                      {"99", "88", "77", "KQs", "KJs", "QJs", "JTs", "T9s"})
+            three_bet_hands = {"AA", "KK", "AKs"}
+            if cls in three_bet_hands and allowed.get("canRaise") and "raise" in available:
+                rr = allowed.get("raiseRange") or {}
+                lo = int(rr.get("min") or call_chips * 3)
+                hi = int(rr.get("max") or lo)
+                amt = max(lo, min(int(call_chips * 3), hi))
+                return {
+                    "action": "raise", "amount": amt,
+                    "message": f"3-bet {cls} for value",
+                    "reasoning": f'{{vr: "3b", ke: "{cls} value", pp: "OOP 3bp", sr: "3x open"}}'
+                }
+            if cls in defend and "call" in available:
+                return {
+                    "action": "call",
+                    "message": f"defend {cls} from {pos}",
+                    "reasoning": f'{{vr: "ln:open", ke: "{cls} def", pp: "OOP flop"}}'
+                }
+            return {"action": "fold",
+                    "message": f"{cls} not in defend range",
+                    "reasoning": _FALLBACK_REASONING}
+
+    # ── 翻后逻辑 ────────────────────────────────────────────────────────
     equity = estimate_equity(hole, board, sims=200, deadline_s=deadline_s)
+    pair_with_board = bool({c[0].upper() for c in hole} &
+                           {c[0].upper() for c in board})
+    strong_hand = equity > 0.70 or pair_with_board
+    is_ip = (self_seat_num % 2 == 0)
+    size_frac = SIZING[texture][street]
 
-    # Decision tree.
-    action_name: str
-    amount: Optional[int] = None
     if call_chips == 0:
-        # Free option: check or bet for value.
-        if equity > 0.7 and allowed.get("canBet"):
-            br = allowed.get("betRange") or {}
-            min_bet = int(br.get("min") or max(int(pot * 0.5), 1))
-            max_bet = int(br.get("max") or min_bet)
-            target = max(min_bet, min(int(pot * 0.66), max_bet))
-            action_name, amount = "bet", target
-        elif "check" in available:
-            action_name = "check"
-        elif "call" in available:
-            action_name = "call"
-        else:
-            action_name = "fold"
+        if strong_hand and ("bet" in available or "raise" in available):
+            br = (allowed.get("betRange") or allowed.get("raiseRange") or {})
+            lo = int(br.get("min") or max(int(pot * 0.33), 1))
+            hi = int(br.get("max") or lo)
+            frac = size_frac if is_ip else size_frac * 0.8
+            amt = max(lo, min(int(pot * frac), hi))
+            act = "bet" if "bet" in available else "raise"
+            return {
+                "action": act, "amount": amt,
+                "message": f"{texture} {street} value bet {int(frac*100)}%",
+                "reasoning": (
+                    f'{{vr: "TAG", ke: "{int(equity*100)}% eq", '
+                    f'bf: [{texture}], pp: "{"IP" if is_ip else "OOP"} barrel", '
+                    f'sr: "{int(frac*100)}% pot"}}')
+            }
+        return {"action": "check" if "check" in available else "fold",
+                "message": f"check {street} on {texture}",
+                "reasoning": _FALLBACK_REASONING}
     else:
-        # Facing a bet.
         if equity < pot_odds - 0.05 and "fold" in available:
-            action_name = "fold"
-        elif equity > 0.8 and allowed.get("canRaise"):
+            return {
+                "action": "fold",
+                "message": f"eq {int(equity*100)}% < pot odds {int(pot_odds*100)}%",
+                "reasoning": _FALLBACK_REASONING
+            }
+        if equity > 0.80 and allowed.get("canRaise") and "raise" in available:
             rr = allowed.get("raiseRange") or {}
-            min_raise = int(rr.get("min") or call_chips * 2)
-            max_raise = int(rr.get("max") or min_raise)
-            target = max(min_raise, min(int(pot * 0.66 + call_chips * 2), max_raise))
-            action_name, amount = "raise", target
-        elif equity >= pot_odds + 0.05 and "call" in available:
-            action_name = "call"
-            # callToAmount = total committed this street after call
-            cta = allowed.get("callToAmount")
-            if cta is not None:
-                amount = int(cta)
-        elif "check" in available:
-            action_name = "check"
-        else:
-            action_name = "fold"
-
-    # Some validators reject `amount` on actions that don't take one. Strip it.
-    if action_name in ("fold", "check", "call"):
-        # call MAY accept amount = callToAmount; the schema permits but doesn't
-        # require it. Safer to omit and let the server compute.
-        amount = None
-
-    msg = _human_message(action_name, equity, pot_odds, hole)
-    return _build(action_name, amount, table, allowed,
-                  eq=equity, po=pot_odds, msg=msg)
+            lo = int(rr.get("min") or call_chips * 2)
+            hi = int(rr.get("max") or lo)
+            amt = max(lo, min(int(pot * size_frac + call_chips * 2), hi))
+            return {
+                "action": "raise", "amount": amt,
+                "message": f"raise for value eq {int(equity*100)}%",
+                "reasoning": (
+                    f'{{vr: "TAG", ke: "{int(equity*100)}% eq", '
+                    f'bf: [{texture}], pp: "value raise", sr: "{int(size_frac*100)}% pot"}}')
+            }
+        if equity >= pot_odds + 0.03 and "call" in available:
+            return {
+                "action": "call",
+                "message": f"call eq {int(equity*100)}% covers {int(pot_odds*100)}%",
+                "reasoning": (
+                    f'{{vr: "ln:bet", ke: "{int(equity*100)}% eq", '
+                    f'bf: [{texture}], pp: "showdown"}}')
+            }
+        if "check" in available:
+            return {"action": "check", "message": "marginal, take free card",
+                    "reasoning": _FALLBACK_REASONING}
+        return {"action": "fold", "message": "marginal spot, fold",
+                "reasoning": _FALLBACK_REASONING}
 
 
 def _build(action: str, amount: Optional[int], table: dict, allowed: dict,
