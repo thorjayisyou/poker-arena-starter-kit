@@ -101,9 +101,9 @@ SEAT_TO_POS = {1: "BTN", 2: "SB", 3: "BB", 4: "UTG", 5: "MP", 6: "CO"}
 
 # Stage 3: 牌面纹理感知尺寸
 SIZING = {
-    "dry":     {"flop": 0.33, "turn": 0.50, "river": 0.66},
-    "wet":     {"flop": 0.66, "turn": 0.75, "river": 0.75},
-    "neutral": {"flop": 0.50, "turn": 0.60, "river": 0.66},
+    "dry":     {"flop": 0.40, "turn": 0.55, "river": 0.75},
+    "wet":     {"flop": 0.70, "turn": 0.80, "river": 0.85},
+    "neutral": {"flop": 0.55, "turn": 0.65, "river": 0.75},
 }
 
 
@@ -277,12 +277,12 @@ def decide(table: dict, deadline_s: float = 10.0,
         else:
             defend = (OPENING_RANGES.get("BB", set()) |
                       {"99", "88", "77", "KQs", "KJs", "QJs", "JTs", "T9s"})
-            three_bet_hands = {"AA", "KK", "AKs"}
+            three_bet_hands = {"AA", "KK", "QQ", "AKs", "AKo"}
             if cls in three_bet_hands and allowed.get("canRaise") and "raise" in available:
                 rr = allowed.get("raiseRange") or {}
                 lo = int(rr.get("min") or call_chips * 3)
                 hi = int(rr.get("max") or lo)
-                amt = max(lo, min(int(call_chips * 3), hi))
+                amt = max(lo, min(int(call_chips * 3.5), hi))
                 return {
                     "action": "raise", "amount": amt,
                     "message": f"3-bet {cls} for value",
@@ -302,11 +302,22 @@ def decide(table: dict, deadline_s: float = 10.0,
     equity = estimate_equity(hole, board, sims=200, deadline_s=deadline_s)
     pair_with_board = bool({c[0].upper() for c in hole} &
                            {c[0].upper() for c in board})
-    strong_hand = equity > 0.70 or pair_with_board
     is_ip = (self_seat_num % 2 == 0)
+    strong_hand = (equity > 0.65 and is_ip) or (equity > 0.70 and not is_ip) or pair_with_board
     size_frac = SIZING[texture][street]
 
     if call_chips == 0:
+        # 河牌坚果超大注
+        if street == "river" and equity > 0.88 and "bet" in available:
+            br = allowed.get("betRange") or {}
+            lo = int(br.get("min") or max(int(pot * 0.50), 1))
+            hi = int(br.get("max") or lo)
+            amt = max(lo, min(int(pot * 0.90), hi))
+            return {
+                "action": "bet", "amount": amt,
+                "message": f"river nut bet 90% eq {int(equity*100)}%",
+                "reasoning": f'{{vr: "TAG", ke: "{int(equity*100)}% eq", bf: [{texture}], pp: "river value", sr: "90% pot"}}'
+            }
         if strong_hand and ("bet" in available or "raise" in available):
             br = (allowed.get("betRange") or allowed.get("raiseRange") or {})
             lo = int(br.get("min") or max(int(pot * 0.33), 1))
@@ -326,7 +337,14 @@ def decide(table: dict, deadline_s: float = 10.0,
                 "message": f"check {street} on {texture}",
                 "reasoning": _FALLBACK_REASONING}
     else:
-        if equity < pot_odds - 0.05 and "fold" in available:
+        # 河牌边际情况直接弃牌
+        if street == "river" and equity < pot_odds + 0.05 and "fold" in available:
+            return {
+                "action": "fold",
+                "message": f"river marginal fold eq {int(equity*100)}%",
+                "reasoning": _FALLBACK_REASONING
+            }
+        if equity < pot_odds and "fold" in available:
             return {
                 "action": "fold",
                 "message": f"eq {int(equity*100)}% < pot odds {int(pot_odds*100)}%",
